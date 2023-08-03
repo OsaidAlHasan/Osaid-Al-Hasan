@@ -1,0 +1,259 @@
+import tkinter as tk
+from tkinter import ttk
+import threading
+import os
+import datetime
+from scapy.all import *
+from scapy.layers.inet import IP, UDP
+import soundfile as sf
+import numpy as np
+
+class PacketCaptureAppUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Network Packet Capture")
+        self.geometry("800x600")
+        self.resizable(False, False)
+
+        self.capture_running = False
+        self.sniff_thread = None
+
+        self.audio_data = []
+        self.call_id = None
+
+        self.log_directory = r"C:\Users\Osaid\Desktop\Captured Audio\Logs"
+        self.audio_directory = r"C:\Users\Osaid\Desktop\Captured Audio"
+
+        self.create_widgets()
+        
+
+    def create_widgets(self):
+        self.create_text_box()
+        self.create_buttons()
+
+    def create_text_box(self):
+        frame = ttk.Frame(self)
+        frame.pack(pady=10)
+
+        self.text_box = tk.Text(frame, height=30, width=80, font=("Arial", 12))
+        self.text_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(frame, command=self.text_box.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text_box.config(yscrollcommand=scrollbar.set)
+
+        self.text_box.tag_configure("rtp", foreground="purple")
+        self.text_box.tag_configure("sip", foreground="red")
+
+    def create_buttons(self):
+        button_frame = ttk.Frame(self)
+        button_frame.pack(pady=10)
+
+        start_button = ttk.Button(button_frame, text="Start Capture", command=self.start_packet_capture)
+        start_button.pack(side=tk.LEFT, padx=10)
+
+        stop_button = ttk.Button(button_frame, text="Stop Capture", command=self.stop_packet_capture)
+        stop_button.pack(side=tk.LEFT, padx=10)
+
+    def handle_session_progress(self, payload_str, ip_src, ip_dst):
+        if "183 Session Progress" in payload_str and "CSeq: 21 INVITE" in payload_str:
+            call_id_index = payload_str.find("i:")
+            call_id_end_index = payload_str.find("\n", call_id_index)
+            call_id = payload_str[call_id_index + 3: call_id_end_index].strip()
+            self.call_id = call_id  # Store the call_id when the call starts
+            self.save_call_info(payload_str, call_id, ip_src, ip_dst)
+            return call_id
+        return None
+
+    def save_call_info(self, payload_str, call_id, ip_src, ip_dst, call_status="Started"):
+        log_directory = os.path.join(self.log_directory, "Calls")
+        os.makedirs(log_directory, exist_ok=True)
+        log_file_path = os.path.join(log_directory, f"Call {call_status}({call_id}).txt")
+        mode = "a" if os.path.exists(log_file_path) else "w"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_file_path, mode) as log_file:
+            log_file.write(f"Call {call_status.lower()} at: {timestamp}\n")
+            log_file.write(f"Call-ID: {call_id}\n")
+            log_file.write(f"Source IP: {ip_src}\n")
+            log_file.write(f"Destination IP: {ip_dst}\n")
+            log_file.write(f"Payload:\n{payload_str}\n\n")
+
+    def save_audio(self):
+        if self.call_id is None:
+            return
+
+        audio_directory = os.path.join(self.audio_directory, "Captured Calls")
+        os.makedirs(audio_directory, exist_ok=True)
+        audio_file_path = os.path.join(audio_directory, f"{self.call_id}.wav")
+
+        sample_width = 2  # 16-bit PCM
+        num_channels = 1  
+        framerate = 8000  
+
+        audio_array = np.array(self.audio_data, dtype=np.int16)  # Convert to NumPy array
+        sf.write(audio_file_path, audio_array, framerate, subtype='PCM_16')
+
+        print(f"Complete audio file {audio_file_path} saved successfully")
+
+
+    def is_rtp_packet(self, packet_payload):
+        if len(packet_payload) >= 12:
+            rtp_version = (packet_payload[0] & 0xC0) >> 6
+            return rtp_version == 2
+        return False
+
+        
+
+class PacketCaptureApp(PacketCaptureAppUI):
+    def __init__(self):
+        super().__init__()
+        self.audio_data_capturing = False
+        self.complete_audio_generated = False
+        
+
+    def is_rtp_packet(self, packet_payload):
+            if len(packet_payload) >= 12:
+                rtp_version = (packet_payload[0] & 0xC0) >> 6
+                return rtp_version == 2
+            return False
+
+
+    def packet_handler(self, packet):
+        if not self.capture_running:
+            return
+
+        if packet.haslayer(IP) and packet.haslayer(UDP) and packet.haslayer(Raw):
+            ip_src = packet[IP].src
+            ip_dst = packet[IP].dst
+            packet_payload = bytes(packet[Raw].load)
+            packet_timestamp = packet.time
+            packet_checksum = packet.chksum
+
+            if b"SIP" in packet_payload:
+                self.handle_sip_packet(packet_payload, ip_src, ip_dst, packet_timestamp, packet_checksum)
+
+            self.handle_rtp_packet(packet_payload, ip_src, ip_dst, packet_timestamp, packet_checksum)
+
+
+    def handle_sip_packet(self, packet_payload, ip_src, ip_dst, packet_timestamp, packet_checksum):
+        if b"SIP" in packet_payload:
+            self.text_box.insert(tk.END, "SIP Packet:\n", "sip")
+            self.text_box.insert(tk.END, f"Source IP: {ip_src}\n")
+            self.text_box.insert(tk.END, f"Destination IP: {ip_dst}\n")
+            try:
+                payload_str = packet_payload.decode('utf-8', errors='ignore')
+            except UnicodeDecodeError:
+                payload_str = "Unable to decode payload."
+            self.text_box.insert(tk.END, f"Payload: {payload_str}\n")
+            self.text_box.insert(tk.END, f"Timestamp: {packet_timestamp}\n")
+            self.text_box.insert(tk.END, f"Checksum: {packet_checksum}\n")
+            self.text_box.insert(tk.END, "========================\n")
+            self.text_box.see(tk.END)
+
+            if "183 Session Progress" in payload_str and "CSeq: 21 INVITE" in payload_str:
+                call_id_index = payload_str.find("i:")
+                call_id_end_index = payload_str.find("\n", call_id_index)
+                call_id = payload_str[call_id_index + 3: call_id_end_index].strip()
+
+                if self.call_id != call_id:
+                    # The call has changed, reset the flags and audio_data list
+                    self.audio_data_capturing = False
+                    self.complete_audio_generated = False
+                    self.audio_data = []  # Clear the audio_data list for the new call
+
+                self.call_id = call_id  # Store the call_id when the call starts
+                self.save_call_info(payload_str, call_id, ip_src, ip_dst)
+                self.audio_data_capturing = True
+
+            elif "CSeq: 21 CANCEL" in payload_str and self.call_id is not None and self.call_id in payload_str:
+                self.save_call_info(payload_str, self.call_id, ip_src, ip_dst, call_status="Ended")
+                if self.audio_data_capturing and not self.complete_audio_generated:
+                    self.save_audio()
+                    self.complete_audio_generated = True
+                    self.audio_data_capturing = False
+
+    def extract_rtp_header(self, packet_payload):
+        if len(packet_payload) >= 12:
+            version = (packet_payload[0] & 0xC0) >> 6
+            padding = (packet_payload[0] & 0x20) >> 5
+            extension = (packet_payload[0] & 0x10) >> 4
+            cc = packet_payload[0] & 0x0F
+            marker = (packet_payload[1] & 0x80) >> 7
+            payload_type = packet_payload[1] & 0x7F
+            sequence_number = int.from_bytes(packet_payload[2:4], byteorder='big')
+            timestamp = int.from_bytes(packet_payload[4:8], byteorder='big')
+            ssrc = int.from_bytes(packet_payload[8:12], byteorder='big')
+
+            return {
+                "Version": version,
+                "Padding": padding,
+                "Extension": extension,
+                "CSRC Count": cc,
+                "Marker": marker,
+                "Payload Type": payload_type,
+                "Sequence Number": sequence_number,
+                "Timestamp": timestamp,
+                "SSRC": ssrc
+            }
+        return None
+
+    def ulaw_decode(self, ulaw_byte):
+        u = ulaw_byte ^ 0xFF  
+        u &= 0x7F  
+        exponent = (u >> 4) & 0x07
+        mantissa = u & 0x0F
+        sample = (mantissa << (exponent + 3)) + 128
+        return sample if ulaw_byte & 0x80 else -sample
+
+    def handle_rtp_packet(self, packet_payload, ip_src, ip_dst, packet_timestamp, packet_checksum):
+        if not self.capture_running:
+            return
+
+        if self.audio_data_capturing and self.is_rtp_packet(packet_payload):
+            rtp_payload = packet_payload[12:]
+            decoded_audio = [self.ulaw_decode(byte) for byte in rtp_payload] 
+            self.audio_data.extend(decoded_audio)  
+            
+
+            # Extract RTP header information
+            rtp_header_info = self.extract_rtp_header(packet_payload)
+
+            # Display RTP packet information in the text box
+            self.text_box.insert(tk.END, "RTP Packet:\n", "rtp")
+            self.text_box.insert(tk.END, f"Source IP: {ip_src}\n")
+            self.text_box.insert(tk.END, f"Destination IP: {ip_dst}\n")
+
+            if rtp_header_info:
+                for field, value in rtp_header_info.items():
+                    self.text_box.insert(tk.END, f"{field}: {value}\n")
+
+            self.text_box.insert(tk.END, f"Payload: {packet_payload}\n")
+            self.text_box.insert(tk.END, f"Timestamp: {packet_timestamp}\n")
+            self.text_box.insert(tk.END, f"Checksum: {packet_checksum}\n")
+            self.text_box.insert(tk.END, "========================\n")
+            self.text_box.see(tk.END)
+
+    
+
+    def start_packet_capture(self):
+        if self.capture_running:
+            return
+
+        self.capture_running = True
+        self.text_box.insert(tk.END, "Capture started\n")
+        self.audio_data_capturing = False
+        self.complete_audio_generated = False
+        self.call_id = None  # Reset call_id for new calls
+        self.sniff_thread = threading.Thread(target=lambda: sniff(prn=self.packet_handler, store=0, filter=""), daemon=True)
+        self.sniff_thread.start()
+
+    def stop_packet_capture(self):
+        if not self.capture_running:
+            return
+
+        self.capture_running = False
+        self.text_box.insert(tk.END, "Capture stopped\n")
+
+if __name__ == "__main__":
+    app = PacketCaptureApp()
+    app.mainloop()
